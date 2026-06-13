@@ -444,6 +444,7 @@ def main():
                 "path": str(output_path),
                 "metadata_path": str(metadata_path),
                 "history_path": str(history_path) if history_path is not None else "",
+                "schema_version": 2,
                 "rows": len(hotspots),
                 "fallback_used": fallback_used,
                 "source_errors": getattr(hotspots, "source_errors", []),
@@ -634,7 +635,7 @@ def _format_evaluation_batch_explain(result: dict) -> str:
 
 def _format_hotspots_explain(hotspots: list, *, provider: str = "") -> str:
     provider_text = getattr(hotspots, "provider_used", "") or provider or "-"
-    metadata_bits = [f"hotspots={len(hotspots)}", f"provider={provider_text}"]
+    metadata_bits = [f"hotspots={len(hotspots)}", f"provider={provider_text}", "schema_version=2"]
     if getattr(hotspots, "fallback_used", False):
         metadata_bits.append("fallback=True")
     if getattr(hotspots, "stale", False):
@@ -646,7 +647,7 @@ def _format_hotspots_explain(hotspots: list, *, provider: str = "") -> str:
         return " ".join(metadata_bits)
     lines = [
         " ".join(metadata_bits),
-        "rank topic source src_rank change heat trend persistence cooling state stage sample leaders",
+        "rank topic source src_rank change heat trend persistence cooling state stage sample quality leaders",
     ]
     for idx, item in enumerate(hotspots, start=1):
         leaders = ",".join(item.leaders[:3]) if getattr(item, "leaders", None) else "-"
@@ -659,7 +660,7 @@ def _format_hotspots_explain(hotspots: list, *, provider: str = "") -> str:
             f"{_fmt_optional_float(item.persistence_score):<11} "
             f"{_fmt_optional_float(item.cooling_score):<7} "
             f"{item.state or '-':<14} {item.stage:<8} "
-            f"{item.sample_stock_count:<6} {leaders}"
+            f"{item.sample_stock_count:<6} {getattr(item, 'quality_status', '-') or '-':<8} {leaders}"
         )
     return "\n".join(lines)
 
@@ -670,6 +671,7 @@ def _format_hotspot_detail_explain(detail) -> str:
     lines = [
         (
             f"topic={summary.topic} source={summary.source or '-'} "
+            f"canonical={getattr(summary, 'canonical_topic', '') or '-'} "
             f"src_rank={summary.rank if summary.rank is not None else '-'} "
             f"change={_fmt_pct(summary.change_pct)} heat={summary.heat_score:.1f} "
             f"trend={_fmt_optional_float(summary.trend_score)} "
@@ -677,10 +679,14 @@ def _format_hotspot_detail_explain(detail) -> str:
             f"cooling={_fmt_optional_float(summary.cooling_score)} "
             f"state={summary.state or '-'} stage={summary.stage} "
             f"sample={summary.sample_stock_count} leaders={leaders} "
+            f"quality={getattr(summary, 'quality_status', '-') or '-'} "
             f"provider={summary.provider_used or '-'} fallback={summary.fallback_used}"
         ),
         "rank code name role score change amount turnover volume_ratio net_inflow active evidence",
     ]
+    missing_fields = getattr(summary, "missing_fields", []) or []
+    if missing_fields:
+        lines.append("missing_fields=" + ",".join(missing_fields))
     if summary.source_errors:
         lines.append("source_errors=" + " | ".join(summary.source_errors))
     for idx, stock in enumerate(detail.stocks, start=1):
@@ -806,6 +812,7 @@ def _write_hotspot_cache_metadata(
     metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
     metadata = {
         "generated_at": generated_at or datetime.now().isoformat(),
+        "schema_version": 2,
         "provider": provider,
         "max_boards": max_boards,
         "rows": rows,

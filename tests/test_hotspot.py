@@ -3,6 +3,7 @@ import json
 import pandas as pd
 
 from alphasift.hotspot import (
+    HotspotStock,
     HotspotSummary,
     append_hotspot_history,
     assign_stock_roles,
@@ -13,6 +14,7 @@ from alphasift.hotspot import (
     load_hotspot_history,
     load_hotspots_json,
     load_hotspot_timeline,
+    resolve_hotspot_topic,
     save_hotspots_json,
     score_hotspot_stock,
 )
@@ -78,6 +80,35 @@ class FailingHotspotProvider:
 
     def stock_board_industry_cons_em(self, symbol):
         raise RuntimeError(f"industry constituents failed for {symbol}")
+
+
+class ConstituentFailingProvider(FakeHotspotProvider):
+    def stock_board_concept_cons_em(self, symbol):
+        raise RuntimeError(f"constituents failed for {symbol}")
+
+    def stock_board_industry_cons_em(self, symbol):
+        raise RuntimeError(f"industry constituents failed for {symbol}")
+
+
+class CanonicalOnlyProvider:
+    def stock_board_concept_name_em(self):
+        return pd.DataFrame([
+            {"板块名称": "算力", "涨跌幅": 4.0, "排名": 1},
+            {"板块名称": "机器人", "涨跌幅": 2.0, "排名": 2},
+        ])
+
+    def stock_board_industry_name_em(self):
+        return pd.DataFrame()
+
+    def stock_board_concept_cons_em(self, symbol):
+        if symbol != "算力":
+            return pd.DataFrame()
+        return pd.DataFrame([
+            {"代码": "300001", "名称": "算力龙头", "涨跌幅": 9.9, "成交额": 2_000_000_000},
+        ])
+
+    def stock_board_industry_cons_em(self, symbol):
+        return pd.DataFrame()
 
 
 def test_heat_score_matches_industry_board_semantics_and_stage_rules():
@@ -176,13 +207,15 @@ def test_load_hotspots_json_reads_saved_shape_and_skips_malformed_rows(tmp_path)
             )
         ],
     )
-    rows = json.loads(cache.read_text(encoding="utf-8"))
-    rows.extend([
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["metadata"]["schema_version"] == 2
+    payload["hotspots"].extend([
         {"topic": "", "heat_score": 80},
         {"topic": "坏数据", "heat_score": 999},
         "not-a-row",
     ])
-    cache.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    cache.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     hotspots = load_hotspots_json(cache)
 
@@ -190,6 +223,45 @@ def test_load_hotspots_json_reads_saved_shape_and_skips_malformed_rows(tmp_path)
     assert hotspots[0].topic == "AI算力"
     assert hotspots[0].heat_score == 82.5
     assert hotspots[0].leaders == ["算力龙头"]
+
+
+def test_load_hotspots_json_reads_old_array_and_dict_shapes(tmp_path):
+    array_cache = tmp_path / "old-array.json"
+    array_cache.write_text(
+        json.dumps([{"topic": "AI算力", "source": "concept", "heat_score": 80}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    dict_cache = tmp_path / "old-dict.json"
+    dict_cache.write_text(
+        json.dumps({"AI算力": {"topic": "AI算力", "heat_score": 81}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    assert load_hotspots_json(array_cache)[0].topic == "AI算力"
+    assert load_hotspots_json(dict_cache)[0].heat_score == 81
+
+
+def test_resolve_hotspot_topic_returns_canonical_candidates_from_cache(tmp_path):
+    cache = tmp_path / "hotspots.json"
+    save_hotspots_json(
+        cache,
+        [
+            HotspotSummary(
+                topic="算力",
+                source="concept",
+                rank=1,
+                heat_score=84,
+                aliases=["AI算力"],
+            )
+        ],
+    )
+
+    resolution = resolve_hotspot_topic("AI算力", fallback_cache_path=cache)
+
+    assert resolution.canonical_topic == "算力"
+    assert resolution.unresolved is False
+    assert resolution.confidence >= 0.55
+    assert resolution.candidates[0]["topic"] == "算力"
 
 
 def test_discover_hotspots_falls_back_to_last_good_cache_on_provider_errors(tmp_path):
@@ -221,6 +293,38 @@ def test_discover_hotspots_tolerates_unknown_provider_and_none_without_network()
     assert any("unknown provider" in error for error in getattr(hotspots, "source_errors"))
 
 
+def test_discover_hotspots_preserves_cached_leaders_when_constituents_fail(tmp_path):
+    cache = tmp_path / "hotspots.json"
+    save_hotspots_json(
+        cache,
+        [
+            HotspotSummary(
+                topic="AI算力",
+                source="concept",
+                rank=1,
+                heat_score=82,
+                leaders=["缓存龙头"],
+                leader_stocks=[HotspotStock(code="300009", name="缓存龙头", role="核心龙头")],
+            )
+        ],
+    )
+
+    hotspots = discover_hotspots(
+        provider=ConstituentFailingProvider(),
+        fallback_cache_path=cache,
+        top=1,
+    )
+
+    assert len(hotspots) == 1
+    assert hotspots[0].topic == "AI算力"
+    assert hotspots[0].fallback_used is True
+    assert hotspots[0].quality_status == "partial"
+    assert hotspots[0].leaders == ["缓存龙头"]
+    assert hotspots[0].leader_stocks[0].source == "last_good_cache.leader_stocks"
+    assert "live_stocks" in hotspots[0].missing_fields
+    assert any("constituents failed for AI算力" in error for error in hotspots[0].source_errors)
+
+
 def test_get_hotspot_detail_scores_stocks_and_sorts_timeline(tmp_path):
     timeline = tmp_path / "timeline.jsonl"
     timeline.write_text(
@@ -243,6 +347,19 @@ def test_get_hotspot_detail_scores_stocks_and_sorts_timeline(tmp_path):
     assert [event.date for event in detail.timeline] == ["2026-06-04", "2026-06-05"]
     assert detail.timeline[0].related_codes == ["300002"]
     assert detail.timeline[1].related_codes == ["300001"]
+
+
+def test_get_hotspot_detail_uses_canonical_topic_for_provider_lookup():
+    detail = get_hotspot_detail(
+        "AI算力",
+        provider=CanonicalOnlyProvider(),
+        top_stocks=1,
+    )
+
+    assert detail.summary.topic == "AI算力"
+    assert detail.summary.canonical_topic == "算力"
+    assert detail.summary.quality_status == "available"
+    assert [stock.name for stock in detail.stocks] == ["算力龙头"]
 
 
 def test_get_hotspot_detail_falls_back_to_cache_and_keeps_valid_timeline(tmp_path):
@@ -269,9 +386,70 @@ def test_get_hotspot_detail_falls_back_to_cache_and_keeps_valid_timeline(tmp_pat
     assert detail.summary.fallback_used is True
     assert detail.summary.stale is True
     assert detail.summary.leaders == ["算力龙头"]
-    assert detail.stocks == []
+    assert len(detail.stocks) == 1
+    assert detail.stocks[0].name == "算力龙头"
+    assert detail.stocks[0].source == "last_good_cache.leaders"
+    assert detail.stocks[0].fallback_used is True
     assert [event.title for event in detail.timeline] == ["订单落地"]
     assert any("eastmoney disconnected" in error for error in detail.summary.source_errors)
+
+
+def test_get_hotspot_detail_uses_structured_leader_stock_fallback(tmp_path):
+    cache = tmp_path / "hotspots.json"
+    save_hotspots_json(
+        cache,
+        [
+            HotspotSummary(
+                topic="算力",
+                source="concept",
+                rank=1,
+                heat_score=82,
+                leaders=["算力龙头"],
+                leader_stocks=[
+                    HotspotStock(
+                        code="300001",
+                        name="算力龙头",
+                        role="核心龙头",
+                        hot_stock_score=90,
+                        source="akshare.concept_constituents",
+                        source_confidence=1.0,
+                    )
+                ],
+            )
+        ],
+    )
+
+    detail = get_hotspot_detail(
+        "AI算力",
+        provider="none",
+        top_stocks=3,
+        fallback_cache_path=cache,
+    )
+
+    assert detail.summary.canonical_topic == "算力"
+    assert detail.summary.quality_status == "stale"
+    assert detail.stocks[0].code == "300001"
+    assert detail.stocks[0].source == "last_good_cache.leader_stocks"
+    assert detail.stocks[0].source_confidence == 0.65
+
+
+def test_get_hotspot_detail_records_timeline_failure_without_losing_cache(tmp_path):
+    cache = tmp_path / "hotspots.json"
+    save_hotspots_json(
+        cache,
+        [HotspotSummary(topic="AI算力", source="concept", rank=1, heat_score=82, leaders=["算力龙头"])],
+    )
+
+    detail = get_hotspot_detail(
+        "AI算力",
+        provider="none",
+        fallback_cache_path=cache,
+        timeline_path=tmp_path / "missing.jsonl",
+    )
+
+    assert detail.stocks[0].name == "算力龙头"
+    assert "timeline" in detail.summary.missing_fields
+    assert any("timeline:" in error for error in detail.summary.source_errors)
 
 
 def test_history_append_loads_trend_compatible_jsonl(tmp_path):
