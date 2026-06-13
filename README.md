@@ -228,7 +228,15 @@ tushare -> sina -> efinance -> akshare_em -> em_datacenter
 | `em_datacenter` | Eastmoney Data Center | Often available outside trading hours |
 | `tushare` | Tushare Pro `daily` + `daily_basic` | Requires token; previous/nearest trading day data |
 
-Daily K-line enrichment defaults to `DAILY_SOURCE=auto`. The auto chain uses `tushare -> tencent -> akshare -> baostock` when a Tushare token is configured, otherwise `tencent -> akshare -> baostock`. Tencent is a direct HTTP K-line source with no wrapper dependency and is preferred over Eastmoney-heavy wrapper paths for candidate-level history enrichment.
+Daily K-line enrichment defaults to `DAILY_SOURCE=auto`. The auto chain uses `tushare -> tencent -> akshare -> baostock` when a Tushare token is configured, otherwise `tencent -> akshare -> baostock`. Tencent is a direct HTTP K-line source with no wrapper dependency and is preferred over Eastmoney-heavy wrapper paths for candidate-level history enrichment. Repeatedly failing sources are temporarily skipped, and expired daily cache can be used as a marked stale fallback when every live daily source fails.
+
+Source support matrix:
+
+| Capability | Primary chain | Fields |
+|---|---|---|
+| Daily K-line enrichment | `tushare` when token exists, then `tencent`, `akshare`, `baostock` | OHLCV, qfq where supported, technical factors |
+| Full-market snapshot | `sina`, then `efinance`, `akshare_em`, `em_datacenter`; `tushare` first when token exists | price, change, amount, market cap, PE/PB, turnover |
+| Last-good fallback | daily history cache and snapshot cache | marked with stale/fallback attrs when live sources fail |
 
 If a source is unavailable or lacks fields required by a strategy, AlphaSift skips it and tries the next source. Eastmoney-only HTTP fallbacks use a shared throttled session to reduce connection churn and bursty access. If all live sources fail, the last-good snapshot fallback is explicitly marked as stale/fallback data; `SNAPSHOT_FALLBACK_MAX_AGE_HOURS` can reject overly old fallback cache to avoid repeating stale selections.
 

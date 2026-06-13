@@ -38,9 +38,13 @@ _DAILY_FEATURE_DEFAULTS = {
 _DAILY_ENRICH_MAX_WORKERS = 1
 _DAILY_HISTORY_CACHE_VERSION = 1
 _DAILY_HISTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
+_SOURCE_HEALTH_FAILURE_THRESHOLD = 3
+_SOURCE_HEALTH_COOLDOWN_SECONDS = 5 * 60
 _DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
 _BAOSTOCK_LOCK = threading.Lock()
 _BAOSTOCK_OUTAGE_ERROR: str | None = None
+_SOURCE_HEALTH: dict[str, dict[str, float]] = {}
+_SOURCE_HEALTH_LOCK = threading.Lock()
 
 
 def enrich_daily_features(
@@ -156,13 +160,17 @@ def fetch_daily_history(
     attempts = max(int(retries), 0) + 1
     errors: list[str] = []
     for current in sources:
+        disabled_reason = _source_disabled_reason(current)
+        if disabled_reason:
+            errors.append(f"{current}: {disabled_reason}")
+            continue
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
                 if current == "yfinance":
                     from alphasift.snapshot_us import fetch_daily_history_yfinance
-                    return fetch_daily_history_yfinance(code, lookback_days=lookback_days)
-                if current == "tencent":
+                    result = fetch_daily_history_yfinance(code, lookback_days=lookback_days)
+                elif current == "tencent":
                     result = _fetch_daily_tencent(
                         normalized_code,
                         lookback_days=normalized_lookback_days,
@@ -190,6 +198,7 @@ def fetch_daily_history(
                         source=src,
                         lookback_days=normalized_lookback_days,
                     )
+                _record_source_success(current)
                 return result
             except Exception as exc:  # noqa: BLE001 - aggregated below
                 last_error = exc
@@ -197,6 +206,18 @@ def fetch_daily_history(
                     break
                 time.sleep(min(0.5 * (attempt + 1), 2.0))
         errors.append(f"{current} after {attempts} attempts: {last_error}")
+        _record_source_failure(current)
+
+    if cache_path is not None:
+        stale = _read_daily_history_cache(
+            cache_path,
+            ttl_seconds=cache_ttl_seconds,
+            allow_stale=True,
+        )
+        if stale is not None:
+            stale.attrs["daily_stale"] = True
+            stale.attrs["source_errors"] = list(errors)
+            return stale
 
     raise RuntimeError(
         f"daily history fetch failed for {normalized_code}: {'; '.join(errors)}"
@@ -225,6 +246,35 @@ def _normalize_max_workers(value: int | None) -> int:
     return max(1, int(value))
 
 
+def _source_disabled_reason(source: str) -> str | None:
+    now = time.monotonic()
+    with _SOURCE_HEALTH_LOCK:
+        state = _SOURCE_HEALTH.get(source)
+        if not state:
+            return None
+        disabled_until = float(state.get("disabled_until", 0.0))
+        if disabled_until <= now:
+            if disabled_until:
+                state["disabled_until"] = 0.0
+            return None
+        return f"temporarily disabled for {disabled_until - now:.1f}s after repeated failures"
+
+
+def _record_source_success(source: str) -> None:
+    with _SOURCE_HEALTH_LOCK:
+        _SOURCE_HEALTH.pop(source, None)
+
+
+def _record_source_failure(source: str) -> None:
+    now = time.monotonic()
+    with _SOURCE_HEALTH_LOCK:
+        state = _SOURCE_HEALTH.setdefault(source, {"failures": 0.0, "disabled_until": 0.0})
+        failures = float(state.get("failures", 0.0)) + 1.0
+        state["failures"] = failures
+        if failures >= _SOURCE_HEALTH_FAILURE_THRESHOLD:
+            state["disabled_until"] = now + _SOURCE_HEALTH_COOLDOWN_SECONDS
+
+
 def _daily_history_cache_path(
     cache_dir: str | Path,
     *,
@@ -243,6 +293,7 @@ def _read_daily_history_cache(
     path: Path,
     *,
     ttl_seconds: float | None,
+    allow_stale: bool = False,
 ) -> pd.DataFrame | None:
     try:
         stat = path.stat()
@@ -250,7 +301,8 @@ def _read_daily_history_cache(
         return None
 
     ttl = _DAILY_HISTORY_CACHE_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds)
-    if ttl <= 0 or time.time() - stat.st_mtime > ttl:
+    is_stale = ttl <= 0 or time.time() - stat.st_mtime > ttl
+    if is_stale and not allow_stale:
         return None
 
     try:
@@ -264,7 +316,10 @@ def _read_daily_history_cache(
         data = frame.get("data")
         if not isinstance(columns, list) or not isinstance(data, list):
             return None
-        return pd.DataFrame(data, columns=columns)
+        df = pd.DataFrame(data, columns=columns)
+        if is_stale:
+            df.attrs["daily_stale"] = True
+        return df
     except Exception:
         return None
 

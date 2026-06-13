@@ -8,7 +8,23 @@ import pandas as pd
 import pytest
 
 from alphasift.daily import compute_daily_features, enrich_daily_features, fetch_daily_history
-from alphasift.daily import _normalize_tushare_adj, _to_baostock_code, _to_tencent_code, _to_tushare_code
+from alphasift.daily import (
+    _SOURCE_HEALTH,
+    _normalize_tushare_adj,
+    _record_source_failure,
+    _record_source_success,
+    _source_disabled_reason,
+    _to_baostock_code,
+    _to_tencent_code,
+    _to_tushare_code,
+)
+
+
+@pytest.fixture(autouse=True)
+def clear_daily_source_health():
+    _SOURCE_HEALTH.clear()
+    yield
+    _SOURCE_HEALTH.clear()
 
 
 def test_compute_daily_features_adds_trend_fields():
@@ -71,6 +87,20 @@ def test_fetch_daily_history_reports_retry_count(monkeypatch):
 
     with pytest.raises(RuntimeError, match="after 2 attempts"):
         fetch_daily_history("000001", retries=1)
+
+
+def test_daily_source_health_temporarily_disables_repeated_failures(monkeypatch):
+    _SOURCE_HEALTH.clear()
+    monkeypatch.setattr("alphasift.daily.time.monotonic", lambda: 100.0)
+
+    _record_source_failure("akshare")
+    _record_source_failure("akshare")
+    assert _source_disabled_reason("akshare") is None
+    _record_source_failure("akshare")
+
+    assert "temporarily disabled" in str(_source_disabled_reason("akshare"))
+    _record_source_success("akshare")
+    assert _source_disabled_reason("akshare") is None
 
 
 def test_fetch_daily_history_uses_cache_until_ttl(tmp_path, monkeypatch):
@@ -147,6 +177,50 @@ def test_fetch_daily_history_refetches_after_cache_expiry(tmp_path, monkeypatch)
     assert calls["count"] == 2
     assert first["收盘"].iloc[-1] == 11
     assert second["收盘"].iloc[-1] == 12
+
+
+def test_fetch_daily_history_uses_stale_cache_after_live_sources_fail(tmp_path, monkeypatch):
+    calls = {"count": 0}
+
+    class FakeAkshare:
+        @staticmethod
+        def stock_zh_a_hist(**kwargs):
+            calls["count"] += 1
+            if calls["count"] > 1:
+                raise ConnectionError("offline")
+            return pd.DataFrame({
+                "日期": pd.date_range("2026-01-01", periods=40).astype(str),
+                "收盘": [11] * 40,
+            })
+
+    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
+    cache_dir = tmp_path / "daily_history"
+
+    fetch_daily_history(
+        "000001",
+        lookback_days=45,
+        source="akshare",
+        retries=0,
+        cache_dir=cache_dir,
+        cache_ttl_seconds=60,
+    )
+    cache_file = next(cache_dir.glob("*.json"))
+    expired = time.time() - 120
+    os.utime(cache_file, (expired, expired))
+
+    stale = fetch_daily_history(
+        "000001",
+        lookback_days=45,
+        source="akshare",
+        retries=0,
+        cache_dir=cache_dir,
+        cache_ttl_seconds=60,
+    )
+
+    assert calls["count"] == 2
+    assert stale.attrs["daily_stale"] is True
+    assert stale.attrs["source_errors"] == ["akshare after 1 attempts: offline"]
+    assert stale["收盘"].iloc[-1] == 11
 
 
 def test_fetch_daily_history_without_cache_dir_preserves_live_fetch(monkeypatch):

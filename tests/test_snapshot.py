@@ -5,14 +5,25 @@ import pandas as pd
 import pytest
 
 from alphasift.snapshot import (
+    _SOURCE_HEALTH,
     _configure_tushare_client,
     _eastmoney_get,
     _fetch_sina,
     _normalize,
     _prepare_tushare_snapshot,
+    _record_source_failure,
+    _record_source_success,
+    _source_disabled_reason,
     fetch_cn_snapshot,
     fetch_snapshot_with_fallback,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_snapshot_source_health():
+    _SOURCE_HEALTH.clear()
+    yield
+    _SOURCE_HEALTH.clear()
 
 
 def test_normalize_efinance_maps_pb_ratio():
@@ -229,6 +240,38 @@ def test_fetch_snapshot_with_fallback_attaches_source_errors(monkeypatch):
     df = fetch_snapshot_with_fallback(["bad", "good"])
 
     assert df.attrs["source_errors"] == ["bad: bad source"]
+
+
+def test_snapshot_source_health_temporarily_disables_repeated_failures(monkeypatch):
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: 200.0)
+
+    _record_source_failure("sina")
+    _record_source_failure("sina")
+    assert _source_disabled_reason("sina") is None
+    _record_source_failure("sina")
+
+    assert "temporarily disabled" in str(_source_disabled_reason("sina"))
+    _record_source_success("sina")
+    assert _source_disabled_reason("sina") is None
+
+
+def test_fetch_snapshot_with_fallback_skips_disabled_sources(monkeypatch):
+    calls = []
+
+    def fake_fetch(source):
+        calls.append(source)
+        return pd.DataFrame([{"code": "000001", "name": "示例", "price": 10.0}])
+
+    monkeypatch.setattr("alphasift.snapshot.fetch_cn_snapshot", fake_fetch)
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: 200.0)
+    _record_source_failure("sina")
+    _record_source_failure("sina")
+    _record_source_failure("sina")
+
+    df = fetch_snapshot_with_fallback(["sina", "efinance"])
+
+    assert calls == ["efinance"]
+    assert df.attrs["source_errors"][0].startswith("sina: temporarily disabled")
 
 
 def test_fetch_snapshot_with_fallback_skips_missing_required_columns(monkeypatch):
