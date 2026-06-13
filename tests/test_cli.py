@@ -186,8 +186,9 @@ def test_cli_hotspot_cache_writes_json_history_and_metadata(monkeypatch, tmp_pat
     main()
 
     assert "rows=1" in capsys.readouterr().out
-    rows = json.loads(output.read_text(encoding="utf-8"))
-    assert rows[0]["topic"] == "AI算力"
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["hotspots"][0]["topic"] == "AI算力"
     history_rows = [
         json.loads(line)
         for line in history.read_text(encoding="utf-8").splitlines()
@@ -196,6 +197,7 @@ def test_cli_hotspot_cache_writes_json_history_and_metadata(monkeypatch, tmp_pat
     assert history_rows[0]["board"] == "AI算力"
     assert history_rows[0]["max_board_heat_score"] == 80
     metadata = json.loads((tmp_path / "hotspots.json.meta.json").read_text(encoding="utf-8"))
+    assert metadata["schema_version"] == 2
     assert metadata["history_path"] == str(history)
 
 

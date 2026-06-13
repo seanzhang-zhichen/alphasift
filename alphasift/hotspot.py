@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,12 @@ class HotspotSummary:
     stage: str = "初次异动"
     sample_stock_count: int = 0
     leaders: list[str] = field(default_factory=list)
+    leader_stocks: list["HotspotStock"] = field(default_factory=list)
+    quality_status: str = "partial"
+    missing_fields: list[str] = field(default_factory=list)
+    canonical_topic: str = ""
+    aliases: list[str] = field(default_factory=list)
+    resolver_candidates: list[dict[str, Any]] = field(default_factory=list)
     provider_used: str = ""
     fallback_used: bool = False
     source_errors: list[str] = field(default_factory=list)
@@ -67,6 +74,19 @@ class HotspotStock:
     evidence_count: int = 0
     role: str = ""
     hot_stock_score: float = 0.0
+    source: str = ""
+    source_confidence: float | None = None
+    fallback_used: bool = False
+
+
+@dataclass
+class HotspotTopicResolution:
+    query: str
+    canonical_topic: str = ""
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    unresolved: bool = True
 
 
 @dataclass
@@ -142,6 +162,46 @@ def classify_hotspot_stage(
     if trend >= 5 and obs >= 2:
         return "确认扩散"
     return "初次异动"
+
+
+def resolve_hotspot_topic(
+    topic: str,
+    *,
+    provider: str | object | None = None,
+    hotspots: list[HotspotSummary | dict[str, Any]] | None = None,
+    fallback_cache_path: str | Path | None = None,
+    max_boards: int = 500,
+    source_errors: list[str] | None = None,
+) -> HotspotTopicResolution:
+    """Resolve a user topic to deterministic canonical hotspot candidates."""
+    topic_text = _safe_text(topic)
+    candidates: list[dict[str, Any]] = []
+    if hotspots:
+        candidates.extend(_topic_candidates_from_hotspots(hotspots, source="cache"))
+
+    if fallback_cache_path:
+        try:
+            candidates.extend(_topic_candidates_from_hotspots(load_hotspots_json(fallback_cache_path), source="cache"))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - resolver should degrade to provider/query candidates.
+            if source_errors is not None:
+                source_errors.append(f"last_good_cache: {exc}")
+
+    if provider is not None:
+        provider_errors = source_errors if source_errors is not None else []
+        for label, provider_obj in _resolve_provider_chain(provider, provider_errors):
+            if provider_obj is None:
+                continue
+            rows = _load_board_summaries(
+                provider_obj,
+                max_boards=max_boards,
+                source_errors=provider_errors,
+                provider_label=label,
+            )
+            candidates.extend(_topic_candidates_from_board_rows(rows, provider_label=label))
+
+    return _resolve_topic_from_candidates(topic_text, candidates)
 
 
 def score_hotspot_stock(row: dict[str, Any] | pd.Series) -> float:
@@ -293,6 +353,8 @@ def discover_hotspots(
             observations=observations,
             state=state,
             stage=stage,
+            canonical_topic=topic,
+            aliases=[topic],
         ))
 
     ranked = sorted(summaries, key=_hotspot_sort_key, reverse=True)[:max(int(top), 0)]
@@ -306,9 +368,20 @@ def discover_hotspots(
             provider_label=provider_used,
         ) if provider_obj is not None else []
         summary.sample_stock_count = len(stocks)
-        summary.leaders = [stock.name or stock.code for stock in stocks if stock.role == "核心龙头"][:3]
-        if not summary.leaders:
-            summary.leaders = [stock.name or stock.code for stock in stocks[:3]]
+        _set_summary_leaders(summary, stocks)
+        if not stocks:
+            fallback_summary = _find_fallback_hotspot(summary.topic, fallback_cache_path, source_errors=source_errors)
+            fallback_stocks = _leader_fallback_stocks(
+                fallback_summary,
+                stale_age_hours=_cache_stale_age_hours(fallback_cache_path),
+            )
+            if fallback_stocks:
+                summary.sample_stock_count = len(fallback_stocks)
+                summary.fallback_used = True
+                _set_summary_leaders(summary, fallback_stocks)
+                _add_missing_fields(summary, ["live_stocks"])
+            else:
+                _add_missing_fields(summary, ["stocks", "leader_stocks"])
     return _with_result_metadata(
         ranked,
         provider_used=provider_used,
@@ -333,42 +406,74 @@ def get_hotspot_detail(
     source_errors: list[str] = []
     provider_chain = _resolve_provider_chain(provider, source_errors)
     provider_used = ""
-    summary = HotspotSummary(topic=topic_text, name=topic_text, source="")
+    fallback_hotspots = _load_hotspot_cache_for_fallback(fallback_cache_path, source_errors=source_errors)
+    cache_resolution = _resolve_topic_from_candidates(
+        topic_text,
+        _topic_candidates_from_hotspots(fallback_hotspots, source="cache"),
+    )
+    fallback_summary = _fallback_summary_for_resolution(topic_text, fallback_hotspots, cache_resolution)
+    best_resolution = cache_resolution
+    summary = HotspotSummary(
+        topic=topic_text,
+        name=topic_text,
+        source="",
+        canonical_topic=cache_resolution.canonical_topic,
+        aliases=cache_resolution.aliases,
+        resolver_candidates=cache_resolution.candidates,
+    )
     stocks: list[HotspotStock] = []
+    lookup_topic_used = topic_text
 
     if topic_text:
         for label, provider_obj in provider_chain:
             provider_used = label or provider_used
             if provider_obj is None:
                 continue
-            row = _find_board_summary(
+            board_rows = _load_board_summaries(
                 provider_obj,
-                topic_text,
+                max_boards=500,
                 source_errors=source_errors,
                 provider_label=label,
             )
+            provider_resolution = _resolve_topic_from_candidates(
+                topic_text,
+                [
+                    *_topic_candidates_from_board_rows(board_rows, provider_label=label),
+                    *_topic_candidates_from_hotspots(fallback_hotspots, source="cache"),
+                ],
+            )
+            if provider_resolution.candidates:
+                best_resolution = provider_resolution
+            lookup_topic = provider_resolution.canonical_topic or cache_resolution.canonical_topic or topic_text
+            lookup_topic_used = lookup_topic
+            row = _find_board_summary_in_rows(board_rows, lookup_topic)
             if row:
                 row_heat = _safe_float(row.get("heat_score"))
                 summary = HotspotSummary(
                     topic=topic_text,
-                    name=topic_text,
+                    name=lookup_topic,
                     source=row.get("source", ""),
                     rank=row.get("rank"),
                     change_pct=row.get("change_pct"),
                     heat_score=row_heat if row_heat is not None else 50.0,
+                    canonical_topic=lookup_topic,
+                    aliases=provider_resolution.aliases,
+                    resolver_candidates=provider_resolution.candidates,
                 )
             source = summary.source or "concept"
             stocks = _load_scored_constituents(
                 provider_obj,
-                topic_text,
+                lookup_topic,
                 source=source,
                 source_errors=source_errors,
                 provider_label=label,
             )
+            if stocks and not summary.source:
+                summary.source = source
             if not stocks and source != "industry":
                 stocks = _load_scored_constituents(
                     provider_obj,
-                    topic_text,
+                    lookup_topic,
                     source="industry",
                     source_errors=source_errors,
                     provider_label=label,
@@ -379,22 +484,52 @@ def get_hotspot_detail(
                 provider_used = label
                 break
 
-    if not stocks and not summary.source:
-        fallback_summary = _find_fallback_hotspot(topic_text, fallback_cache_path, source_errors=source_errors)
-        if fallback_summary is not None:
-            stale_age = _cache_stale_age_hours(fallback_cache_path)
-            summary = fallback_summary
-            _apply_summary_metadata(
-                summary,
-                provider_used="last_good_cache",
-                fallback_used=True,
-                source_errors=source_errors or ["none: no live detail rows"],
-                stale=True,
-                stale_age_hours=stale_age,
-            )
+    if not stocks and not summary.source and fallback_summary is not None:
+        cached_summary = _copy_hotspot_summary(fallback_summary)
+        if cached_summary.topic != topic_text:
+            cached_summary.name = cached_summary.topic
+            cached_summary.topic = topic_text
+        summary = cached_summary
+        summary.canonical_topic = cache_resolution.canonical_topic or fallback_summary.canonical_topic or fallback_summary.topic
+        summary.aliases = cache_resolution.aliases or summary.aliases
+        summary.resolver_candidates = cache_resolution.candidates
+        stale_age = _cache_stale_age_hours(fallback_cache_path)
+        _apply_summary_metadata(
+            summary,
+            provider_used="last_good_cache",
+            fallback_used=True,
+            source_errors=source_errors or ["none: no live detail rows"],
+            stale=True,
+            stale_age_hours=stale_age,
+        )
+
+    if best_resolution.candidates:
+        summary.canonical_topic = best_resolution.canonical_topic or summary.canonical_topic
+        summary.aliases = best_resolution.aliases
+        summary.resolver_candidates = best_resolution.candidates
+    if not summary.canonical_topic and topic_text:
+        summary.canonical_topic = topic_text if not best_resolution.unresolved else ""
+    if stocks and not summary.canonical_topic:
+        summary.canonical_topic = lookup_topic_used or topic_text
+
+    if not stocks:
+        stale_age = _cache_stale_age_hours(fallback_cache_path)
+        leader_source = fallback_summary if fallback_summary is not None else summary
+        stocks = _leader_fallback_stocks(leader_source, stale_age_hours=stale_age)
+        if stocks:
+            summary.fallback_used = True
+            summary.stale = summary.stale or fallback_summary is not None
+            summary.stale_age_hours = stale_age if fallback_summary is not None else summary.stale_age_hours
+            _add_missing_fields(summary, ["live_stocks"])
+        else:
+            _add_missing_fields(summary, ["stocks", "leader_stocks"])
 
     trends = _load_history_trends(history_path)
-    trend = trends.get(topic_text, {})
+    trend = (
+        trends.get(summary.canonical_topic or "")
+        or trends.get(topic_text, {})
+        or trends.get(summary.name, {})
+    )
     latest_score = _safe_float(trend.get("board_heat_latest_score"))
     summary.heat_score = round(latest_score if latest_score is not None else summary.heat_score, 4)
     summary.trend_score = _safe_float(trend.get("board_heat_trend_score"))
@@ -412,20 +547,29 @@ def get_hotspot_detail(
     )
     if not summary.fallback_used or stocks:
         summary.sample_stock_count = len(stocks)
-        summary.leaders = [stock.name or stock.code for stock in stocks if stock.role == "核心龙头"][:3]
-        if not summary.leaders:
-            summary.leaders = [stock.name or stock.code for stock in stocks[:3]]
+        _set_summary_leaders(summary, stocks)
     if not summary.provider_used:
         _apply_summary_metadata(
             summary,
             provider_used=provider_used,
-            fallback_used=False,
+            fallback_used=summary.fallback_used,
             source_errors=source_errors,
-            stale=False,
-            stale_age_hours=None,
+            stale=summary.stale,
+            stale_age_hours=summary.stale_age_hours,
         )
+    _finalize_summary_quality(summary, stock_count=len(stocks))
 
-    timeline = load_hotspot_timeline(timeline_path, topic=topic_text) if timeline_path else []
+    timeline: list[TimelineEvent] = []
+    if timeline_path:
+        try:
+            timeline = load_hotspot_timeline(timeline_path, topic=summary.canonical_topic or topic_text)
+            if summary.canonical_topic and summary.canonical_topic != topic_text:
+                timeline.extend(load_hotspot_timeline(timeline_path, topic=topic_text))
+                timeline = _dedupe_timeline(timeline)
+        except Exception as exc:  # noqa: BLE001 - timeline is evidence, not a hard dependency.
+            summary.source_errors = _dedupe_errors([*summary.source_errors, f"timeline: {exc}"])
+            _add_missing_fields(summary, ["timeline"])
+            _finalize_summary_quality(summary, stock_count=len(stocks))
     return HotspotDetail(summary=summary, stocks=stocks[:max(int(top_stocks), 0)], timeline=timeline)
 
 
@@ -536,7 +680,9 @@ def load_hotspots_json(path_like: str | Path) -> list[HotspotSummary]:
     except json.JSONDecodeError:
         return []
 
-    if isinstance(payload, dict):
+    if isinstance(payload, dict) and any(key in payload for key in ("topic", "board", "hotspot")):
+        raw_rows = [payload]
+    elif isinstance(payload, dict):
         raw_rows = (
             payload.get("hotspots")
             or payload.get("rows")
@@ -544,6 +690,8 @@ def load_hotspots_json(path_like: str | Path) -> list[HotspotSummary]:
             or payload.get("data")
             or []
         )
+        if not raw_rows and all(isinstance(value, dict) for value in payload.values()):
+            raw_rows = list(payload.values())
     else:
         raw_rows = payload
     if not isinstance(raw_rows, list):
@@ -560,10 +708,28 @@ def load_hotspots_json(path_like: str | Path) -> list[HotspotSummary]:
 def save_hotspots_json(path_like: str | Path, hotspots: list[HotspotSummary]) -> Path:
     path = Path(path_like)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps([asdict(item) for item in hotspots], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    generated_at = datetime.now(timezone.utc).isoformat()
+    rows = [asdict(item) for item in hotspots]
+    payload = {
+        "schema_version": 2,
+        "generated_at": generated_at,
+        "metadata": {
+            "schema_version": 2,
+            "asset_type": "hotspot_cache",
+            "generated_at": generated_at,
+            "row_count": len(rows),
+            "last_good": True,
+            "quality_counts": _quality_counts(hotspots),
+        },
+        "hotspots": rows,
+    }
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
     return path
 
 
@@ -694,6 +860,14 @@ def _find_board_summary(
     return None
 
 
+def _find_board_summary_in_rows(rows: list[dict[str, Any]], topic: str) -> dict[str, Any] | None:
+    topic_key = _normalize_topic_key(topic)
+    for row in rows:
+        if _normalize_topic_key(row.get("topic")) == topic_key:
+            return row
+    return None
+
+
 def _load_scored_constituents(
     provider: object,
     topic: str,
@@ -724,7 +898,13 @@ def _load_scored_constituents(
     if frame is None:
         return []
     rows = [asdict(stock) for stock in _normalize_stock_rows(frame)]
-    return assign_stock_roles(rows)
+    stocks = assign_stock_roles(rows)
+    stock_source = f"{provider_label or 'provider'}.{source}_constituents"
+    for stock in stocks:
+        stock.source = stock.source or stock_source
+        stock.source_confidence = stock.source_confidence if stock.source_confidence is not None else 1.0
+        stock.fallback_used = False
+    return stocks
 
 
 def _normalize_stock_rows(frame: pd.DataFrame) -> list[HotspotStock]:
@@ -772,7 +952,11 @@ def _coerce_hotspot_stock(item: dict[str, Any] | HotspotStock) -> HotspotStock:
             is_limit_up=_safe_bool(_row_value(item, ["is_limit_up", "涨停"])),
             active_days=int(_safe_float(_row_value(item, ["active_days", "连续活跃"])) or 0),
             evidence_count=int(_safe_float(_row_value(item, ["evidence_count", "证据数"])) or 0),
+            role=_safe_text(item.get("role")),
             hot_stock_score=_safe_float(item.get("hot_stock_score")) or 0.0,
+            source=_safe_text(item.get("source")),
+            source_confidence=_safe_float(item.get("source_confidence")),
+            fallback_used=_safe_bool(item.get("fallback_used")),
         )
     if stock.hot_stock_score <= 0:
         stock.hot_stock_score = score_hotspot_stock(asdict(stock))
@@ -794,7 +978,11 @@ def _coerce_hotspot_summary(item: object) -> HotspotSummary | None:
         return None
     rank = _safe_float(item.get("rank"))
     leaders = item.get("leaders")
+    leader_stocks = item.get("leader_stocks")
     source_errors = item.get("source_errors")
+    missing_fields = item.get("missing_fields")
+    aliases = item.get("aliases")
+    resolver_candidates = item.get("resolver_candidates")
     return HotspotSummary(
         topic=topic,
         name=_safe_text(item.get("name")) or topic,
@@ -810,6 +998,28 @@ def _coerce_hotspot_summary(item: object) -> HotspotSummary | None:
         stage=_safe_text(item.get("stage")) or "初次异动",
         sample_stock_count=int(_safe_float(item.get("sample_stock_count")) or 0),
         leaders=[_safe_text(value) for value in leaders if _safe_text(value)] if isinstance(leaders, list) else [],
+        leader_stocks=[
+            _coerce_hotspot_stock(value)
+            for value in leader_stocks
+            if isinstance(value, (dict, HotspotStock))
+        ] if isinstance(leader_stocks, list) else [],
+        quality_status=_safe_text(item.get("quality_status")) or "partial",
+        missing_fields=[
+            _safe_text(value)
+            for value in missing_fields
+            if _safe_text(value)
+        ] if isinstance(missing_fields, list) else [],
+        canonical_topic=_safe_text(item.get("canonical_topic")) or topic,
+        aliases=[
+            _safe_text(value)
+            for value in aliases
+            if _safe_text(value)
+        ] if isinstance(aliases, list) else [],
+        resolver_candidates=[
+            value
+            for value in resolver_candidates
+            if isinstance(value, dict)
+        ] if isinstance(resolver_candidates, list) else [],
         provider_used=_safe_text(item.get("provider_used")),
         fallback_used=_safe_bool(item.get("fallback_used")),
         source_errors=[
@@ -820,6 +1030,298 @@ def _coerce_hotspot_summary(item: object) -> HotspotSummary | None:
         stale=_safe_bool(item.get("stale")),
         stale_age_hours=_safe_float(item.get("stale_age_hours")),
     )
+
+
+def _topic_candidates_from_hotspots(
+    hotspots: list[HotspotSummary | dict[str, Any]],
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in hotspots:
+        summary = _coerce_hotspot_summary(item)
+        if summary is None:
+            continue
+        aliases = _dedupe_texts([
+            summary.topic,
+            summary.name,
+            summary.canonical_topic,
+            *summary.aliases,
+        ])
+        candidates.append({
+            "topic": summary.canonical_topic or summary.topic,
+            "name": summary.name or summary.topic,
+            "source": summary.source,
+            "origin": source,
+            "rank": summary.rank,
+            "heat_score": summary.heat_score,
+            "aliases": aliases,
+        })
+    return candidates
+
+
+def _topic_candidates_from_board_rows(
+    rows: list[dict[str, Any]],
+    *,
+    provider_label: str,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        topic = _safe_text(row.get("topic"))
+        if not topic:
+            continue
+        candidates.append({
+            "topic": topic,
+            "name": topic,
+            "source": _safe_text(row.get("source")),
+            "origin": provider_label or "provider",
+            "rank": row.get("rank"),
+            "heat_score": _safe_float(row.get("heat_score")) or 0.0,
+            "aliases": [topic],
+        })
+    return candidates
+
+
+def _resolve_topic_from_candidates(
+    topic: str,
+    candidates: list[dict[str, Any]],
+) -> HotspotTopicResolution:
+    query = _safe_text(topic)
+    ranked: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        candidate_topic = _safe_text(candidate.get("topic") or candidate.get("name"))
+        if not candidate_topic:
+            continue
+        aliases = _dedupe_texts([
+            candidate_topic,
+            candidate.get("name"),
+            *candidate.get("aliases", []),
+        ])
+        confidence, match_type = _topic_match_score(query, aliases)
+        if confidence < 0.3:
+            continue
+        key = (_normalize_topic_key(candidate_topic), _safe_text(candidate.get("origin")))
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append({
+            "topic": candidate_topic,
+            "name": _safe_text(candidate.get("name")) or candidate_topic,
+            "source": _safe_text(candidate.get("source")),
+            "origin": _safe_text(candidate.get("origin")),
+            "rank": candidate.get("rank"),
+            "heat_score": _safe_float(candidate.get("heat_score")) or 0.0,
+            "aliases": aliases,
+            "confidence": round(confidence, 4),
+            "match_type": match_type,
+        })
+
+    ranked.sort(
+        key=lambda item: (
+            _safe_float(item.get("confidence")) or 0.0,
+            _safe_float(item.get("heat_score")) or 0.0,
+            -(_safe_float(item.get("rank")) or 999999.0),
+            item.get("topic", ""),
+        ),
+        reverse=True,
+    )
+    top = ranked[0] if ranked else None
+    confidence = _safe_float(top.get("confidence")) if top else 0.0
+    canonical_topic = _safe_text(top.get("topic")) if top and confidence is not None and confidence >= 0.55 else ""
+    aliases = _dedupe_texts([query, *(top.get("aliases", []) if top else [])])
+    return HotspotTopicResolution(
+        query=query,
+        canonical_topic=canonical_topic,
+        candidates=ranked[:5],
+        aliases=aliases,
+        confidence=round(confidence or 0.0, 4),
+        unresolved=not bool(canonical_topic),
+    )
+
+
+def _topic_match_score(query: str, aliases: list[str]) -> tuple[float, str]:
+    query_key = _normalize_topic_key(query)
+    if not query_key:
+        return 0.0, "empty"
+    best = (0.0, "none")
+    for alias in aliases:
+        alias_key = _normalize_topic_key(alias)
+        if not alias_key:
+            continue
+        if alias_key == query_key:
+            return 1.0, "exact"
+        if len(alias_key) >= 2 and alias_key in query_key:
+            ratio = len(alias_key) / max(len(query_key), 1)
+            best = max(best, (0.82 + min(ratio, 1.0) * 0.08, "alias_contains"), key=lambda item: item[0])
+            continue
+        if len(query_key) >= 2 and query_key in alias_key:
+            ratio = len(query_key) / max(len(alias_key), 1)
+            best = max(best, (0.78 + min(ratio, 1.0) * 0.1, "query_contains"), key=lambda item: item[0])
+            continue
+        query_chars = set(query_key)
+        alias_chars = set(alias_key)
+        overlap = len(query_chars & alias_chars) / max(len(query_chars | alias_chars), 1)
+        if overlap >= 0.45:
+            best = max(best, (0.42 + overlap * 0.28, "char_overlap"), key=lambda item: item[0])
+    return best
+
+
+def _normalize_topic_key(value: object) -> str:
+    text = _safe_text(value).lower()
+    text = text.replace("人工智能", "ai")
+    for token in ("概念", "板块", "行业", "产业", "主题", "指数"):
+        text = text.replace(token, "")
+    return "".join(char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+
+
+def _load_hotspot_cache_for_fallback(
+    fallback_cache_path: str | Path | None,
+    *,
+    source_errors: list[str],
+) -> list[HotspotSummary]:
+    if not fallback_cache_path:
+        return []
+    try:
+        return load_hotspots_json(fallback_cache_path)
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001 - fallback cache must not wipe live detail data.
+        source_errors.append(f"last_good_cache: {exc}")
+        return []
+
+
+def _fallback_summary_for_resolution(
+    topic: str,
+    hotspots: list[HotspotSummary],
+    resolution: HotspotTopicResolution,
+) -> HotspotSummary | None:
+    topic_key = _normalize_topic_key(topic)
+    canonical_key = _normalize_topic_key(resolution.canonical_topic)
+    for hotspot in hotspots:
+        keys = {
+            _normalize_topic_key(hotspot.topic),
+            _normalize_topic_key(hotspot.name),
+            _normalize_topic_key(hotspot.canonical_topic),
+            *(_normalize_topic_key(alias) for alias in hotspot.aliases),
+        }
+        if topic_key in keys or (canonical_key and canonical_key in keys):
+            return hotspot
+    return None
+
+
+def _copy_hotspot_summary(summary: HotspotSummary) -> HotspotSummary:
+    copied = _coerce_hotspot_summary(asdict(summary))
+    return copied if copied is not None else summary
+
+
+def _copy_hotspot_stock(stock: HotspotStock) -> HotspotStock:
+    return _coerce_hotspot_stock(asdict(stock))
+
+
+def _leader_fallback_stocks(
+    summary: HotspotSummary | None,
+    *,
+    stale_age_hours: float | None,
+) -> list[HotspotStock]:
+    if summary is None:
+        return []
+    stocks: list[HotspotStock] = []
+    for stock in summary.leader_stocks:
+        copied = _copy_hotspot_stock(stock)
+        if not copied.code and not copied.name:
+            continue
+        copied.source = "last_good_cache.leader_stocks"
+        copied.source_confidence = _stale_confidence(0.65, stale_age_hours)
+        copied.fallback_used = True
+        copied.role = copied.role or "核心龙头"
+        stocks.append(copied)
+    if stocks:
+        return stocks
+
+    for idx, leader in enumerate(summary.leaders[:3]):
+        text = _safe_text(leader)
+        if not text:
+            continue
+        stocks.append(HotspotStock(
+            code="",
+            name=text,
+            role="核心龙头" if idx == 0 else "助攻",
+            hot_stock_score=0.0,
+            source="last_good_cache.leaders",
+            source_confidence=_stale_confidence(0.45, stale_age_hours),
+            fallback_used=True,
+        ))
+    return stocks
+
+
+def _set_summary_leaders(summary: HotspotSummary, stocks: list[HotspotStock]) -> None:
+    selected = [stock for stock in stocks if stock.role == "核心龙头"][:3]
+    if not selected:
+        selected = stocks[:3]
+    summary.leader_stocks = [_copy_hotspot_stock(stock) for stock in selected]
+    summary.leaders = [
+        stock.name or stock.code
+        for stock in summary.leader_stocks
+        if stock.name or stock.code
+    ]
+
+
+def _add_missing_fields(summary: HotspotSummary, fields: list[str]) -> None:
+    summary.missing_fields = _dedupe_texts([*summary.missing_fields, *fields])
+
+
+def _finalize_summary_quality(summary: HotspotSummary, *, stock_count: int | None = None) -> None:
+    if not summary.canonical_topic:
+        _add_missing_fields(summary, ["canonical_topic"])
+    if not summary.source:
+        _add_missing_fields(summary, ["source"])
+    count = summary.sample_stock_count if stock_count is None else stock_count
+    if count <= 0 and not summary.leader_stocks:
+        _add_missing_fields(summary, ["stocks"])
+    summary.missing_fields = _dedupe_texts(summary.missing_fields)
+    if summary.stale:
+        summary.quality_status = "stale"
+    elif "canonical_topic" in summary.missing_fields and not summary.resolver_candidates:
+        summary.quality_status = "failed"
+    elif summary.missing_fields:
+        summary.quality_status = "partial"
+    else:
+        summary.quality_status = "available"
+
+
+def _quality_counts(hotspots: list[HotspotSummary]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for hotspot in hotspots:
+        status = _safe_text(getattr(hotspot, "quality_status", "")) or "partial"
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _stale_confidence(base: float, stale_age_hours: float | None) -> float:
+    if stale_age_hours is None:
+        return round(base, 4)
+    if stale_age_hours <= 24:
+        return round(base, 4)
+    return round(max(base * 0.5, base - min(stale_age_hours / 240.0, 0.25)), 4)
+
+
+def _dedupe_timeline(events: list[TimelineEvent]) -> list[TimelineEvent]:
+    deduped: dict[tuple[str, str, str], TimelineEvent] = {}
+    for event in events:
+        deduped[(event.date, event.source, event.title)] = event
+    return sorted(deduped.values(), key=lambda item: (item.date, item.source, item.title))
+
+
+def _dedupe_texts(values: list[object]) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _safe_text(value)
+        if text and text not in seen:
+            seen.add(text)
+            items.append(text)
+    return items
 
 
 def _load_fallback_hotspots(
@@ -858,17 +1360,12 @@ def _find_fallback_hotspot(
 ) -> HotspotSummary | None:
     if not fallback_cache_path or not topic:
         return None
-    try:
-        hotspots = load_hotspots_json(fallback_cache_path)
-    except FileNotFoundError:
-        return None
-    except Exception as exc:  # noqa: BLE001 - malformed fallback cache should not crash live flow.
-        source_errors.append(f"last_good_cache: {exc}")
-        return None
-    for hotspot in hotspots:
-        if hotspot.topic == topic or hotspot.name == topic:
-            return hotspot
-    return None
+    hotspots = _load_hotspot_cache_for_fallback(fallback_cache_path, source_errors=source_errors)
+    resolution = _resolve_topic_from_candidates(
+        topic,
+        _topic_candidates_from_hotspots(hotspots, source="cache"),
+    )
+    return _fallback_summary_for_resolution(topic, hotspots, resolution)
 
 
 def _with_result_metadata(
@@ -890,6 +1387,7 @@ def _with_result_metadata(
             stale=stale,
             stale_age_hours=stale_age_hours,
         )
+        _finalize_summary_quality(hotspot, stock_count=hotspot.sample_stock_count)
     return HotspotResults(
         hotspots,
         provider_used=provider_used,
@@ -910,10 +1408,10 @@ def _apply_summary_metadata(
     stale_age_hours: float | None,
 ) -> None:
     summary.provider_used = provider_used
-    summary.fallback_used = fallback_used
+    summary.fallback_used = bool(summary.fallback_used or fallback_used)
     summary.source_errors = _dedupe_errors(source_errors)
-    summary.stale = stale
-    summary.stale_age_hours = stale_age_hours
+    summary.stale = bool(summary.stale or stale)
+    summary.stale_age_hours = summary.stale_age_hours if summary.stale_age_hours is not None else stale_age_hours
 
 
 def _cache_stale_age_hours(path_like: str | Path | None) -> float | None:
