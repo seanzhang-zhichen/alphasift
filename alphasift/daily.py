@@ -204,9 +204,11 @@ def fetch_daily_history(
                         normalized_code,
                         lookback_days=normalized_lookback_days,
                     )
+                _record_source_success(current, rows=len(result))
                 result.attrs["daily_source"] = current
                 result.attrs["daily_requested_source"] = src
                 result.attrs["source_errors"] = list(errors)
+                result.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
                 if cache_path is not None:
                     _write_daily_history_cache(
                         cache_path,
@@ -215,7 +217,6 @@ def fetch_daily_history(
                         source=src,
                         lookback_days=normalized_lookback_days,
                     )
-                _record_source_success(current)
                 return result
             except Exception as exc:  # noqa: BLE001 - aggregated below
                 last_error = exc
@@ -234,6 +235,7 @@ def fetch_daily_history(
         if stale is not None:
             stale.attrs["daily_stale"] = True
             stale.attrs["source_errors"] = list(errors)
+            stale.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
             return stale
 
     raise RuntimeError(
@@ -277,9 +279,18 @@ def _source_disabled_reason(source: str) -> str | None:
         return f"temporarily disabled for {disabled_until - now:.1f}s after repeated failures"
 
 
-def _record_source_success(source: str) -> None:
+def _record_source_success(source: str, *, rows: int | None = None) -> None:
     with _SOURCE_HEALTH_LOCK:
-        _SOURCE_HEALTH.pop(source, None)
+        state = _SOURCE_HEALTH.setdefault(source, {"failures": 0.0, "disabled_until": 0.0})
+        successes = float(state.get("successes", 0.0)) + 1.0
+        state["successes"] = successes
+        state["failures"] = 0.0
+        state["disabled_until"] = 0.0
+        state["last_success_at"] = time.time()
+        if rows is not None:
+            state["last_rows"] = float(rows)
+            previous_avg = float(state.get("avg_rows", rows))
+            state["avg_rows"] = previous_avg + (float(rows) - previous_avg) / successes
 
 
 def _record_source_failure(source: str) -> None:
@@ -288,8 +299,33 @@ def _record_source_failure(source: str) -> None:
         state = _SOURCE_HEALTH.setdefault(source, {"failures": 0.0, "disabled_until": 0.0})
         failures = float(state.get("failures", 0.0)) + 1.0
         state["failures"] = failures
+        state["total_failures"] = float(state.get("total_failures", 0.0)) + 1.0
+        state["last_failure_at"] = time.time()
         if failures >= _SOURCE_HEALTH_FAILURE_THRESHOLD:
             state["disabled_until"] = now + _SOURCE_HEALTH_COOLDOWN_SECONDS
+
+
+def daily_source_health_snapshot() -> dict[str, dict[str, float | bool]]:
+    """Return a copy of in-process daily-source health statistics."""
+    return _daily_source_health_snapshot(tuple(_SOURCE_HEALTH))
+
+
+def _daily_source_health_snapshot(sources: tuple[str, ...]) -> dict[str, dict[str, float | bool]]:
+    now = time.monotonic()
+    snapshot: dict[str, dict[str, float | bool]] = {}
+    with _SOURCE_HEALTH_LOCK:
+        for source in sources:
+            state = dict(_SOURCE_HEALTH.get(source, {}))
+            disabled_until = float(state.get("disabled_until", 0.0))
+            snapshot[source] = {
+                "successes": float(state.get("successes", 0.0)),
+                "failures": float(state.get("failures", 0.0)),
+                "total_failures": float(state.get("total_failures", 0.0)),
+                "last_rows": float(state.get("last_rows", 0.0)),
+                "avg_rows": float(state.get("avg_rows", 0.0)),
+                "disabled": disabled_until > now,
+            }
+    return snapshot
 
 
 def _daily_history_cache_path(
@@ -336,7 +372,7 @@ def _read_daily_history_cache(
         df = pd.DataFrame(data, columns=columns)
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            for key in ("daily_source", "daily_requested_source", "source_errors"):
+            for key in ("daily_source", "daily_requested_source", "source_errors", "daily_source_health"):
                 if key in metadata:
                     df.attrs[key] = metadata[key]
         if is_stale:
@@ -367,6 +403,7 @@ def _write_daily_history_cache(
                 "daily_source": df.attrs.get("daily_source", source),
                 "daily_requested_source": df.attrs.get("daily_requested_source", source),
                 "source_errors": list(df.attrs.get("source_errors", [])),
+                "daily_source_health": df.attrs.get("daily_source_health", {}),
             },
             "created_at": datetime.now().isoformat(),
             "frame": json.loads(df.to_json(orient="split", date_format="iso", force_ascii=False)),

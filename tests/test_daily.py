@@ -7,7 +7,7 @@ import types
 import pandas as pd
 import pytest
 
-from alphasift.daily import compute_daily_features, enrich_daily_features, fetch_daily_history
+from alphasift.daily import compute_daily_features, daily_source_health_snapshot, enrich_daily_features, fetch_daily_history
 from alphasift.daily import (
     _SOURCE_HEALTH,
     _normalize_tushare_adj,
@@ -125,6 +125,23 @@ def test_daily_source_health_temporarily_disables_repeated_failures(monkeypatch)
     assert _source_disabled_reason("akshare") is None
 
 
+def test_daily_source_health_tracks_success_failure_and_rows(monkeypatch):
+    _SOURCE_HEALTH.clear()
+    monkeypatch.setattr("alphasift.daily.time.monotonic", lambda: 100.0)
+    _record_source_failure("tencent")
+    _record_source_success("tencent", rows=40)
+    _record_source_success("sina", rows=30)
+
+    snapshot = daily_source_health_snapshot()
+
+    assert snapshot["tencent"]["successes"] == 1.0
+    assert snapshot["tencent"]["failures"] == 0.0
+    assert snapshot["tencent"]["total_failures"] == 1.0
+    assert snapshot["tencent"]["last_rows"] == 40.0
+    assert snapshot["tencent"]["disabled"] is False
+    assert snapshot["sina"]["avg_rows"] == 30.0
+
+
 def test_fetch_daily_history_uses_cache_until_ttl(tmp_path, monkeypatch):
     calls = {"count": 0}
 
@@ -161,6 +178,8 @@ def test_fetch_daily_history_uses_cache_until_ttl(tmp_path, monkeypatch):
     assert first.attrs["daily_source"] == "akshare"
     assert second.attrs["daily_source"] == "akshare"
     assert second.attrs["daily_requested_source"] == "akshare"
+    assert second.attrs["daily_source_health"]["akshare"]["successes"] == 1.0
+    assert second.attrs["daily_source_health"]["akshare"]["last_rows"] == 40.0
     assert len(list((tmp_path / "daily_history").glob("*.json"))) == 1
 
 
