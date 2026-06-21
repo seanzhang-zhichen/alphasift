@@ -203,10 +203,25 @@ def screen(
             daily_enriched = True
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]
             daily_enrich_count = int(enriched.attrs.get("daily_success_count", len(enriched)))
+            daily_source_counts = dict(enriched.attrs.get("daily_source_counts", {}) or {})
+            daily_quality_flag_counts = dict(enriched.attrs.get("daily_quality_flag_counts", {}) or {})
+            daily_source_order_notes = [str(item) for item in enriched.attrs.get("daily_source_order_notes", [])]
             degradation.append(
                 f"Daily K-line enrichment attempted {enrich_count} candidates, "
                 f"succeeded {daily_enrich_count} of {after_filter_count} snapshot-filtered candidates"
             )
+            if daily_source_counts:
+                source_summary = ", ".join(
+                    f"{name}={count}" for name, count in sorted(daily_source_counts.items())
+                )
+                degradation.append(f"Daily K-line sources: {source_summary}")
+            if daily_quality_flag_counts:
+                flag_summary = ", ".join(
+                    f"{name}={count}" for name, count in sorted(daily_quality_flag_counts.items())
+                )
+                degradation.append(f"Daily K-line quality flags: {flag_summary}")
+            if daily_source_order_notes:
+                degradation.append("Daily K-line source ordering: " + " | ".join(daily_source_order_notes[:3]))
             if daily_errors:
                 sample = " | ".join(daily_errors[:5])
                 suffix = f" | +{len(daily_errors) - 5} more" if len(daily_errors) > 5 else ""

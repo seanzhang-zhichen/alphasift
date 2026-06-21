@@ -596,6 +596,8 @@ def test_enrich_daily_features_keeps_successful_rows_when_one_fetch_fails(monkey
             "收盘": [10 + i * 0.1 for i in range(80)],
         })
         hist.attrs["daily_source"] = "akshare"
+        hist.attrs["daily_source_order_notes"] = ["daily source order adjusted by health: akshare"]
+        hist.attrs["daily_source_health"] = {"akshare": {"successes": 1.0}}
         return hist
 
     monkeypatch.setattr("alphasift.daily.fetch_daily_history", fake_fetch_daily_history)
@@ -609,6 +611,10 @@ def test_enrich_daily_features_keeps_successful_rows_when_one_fetch_fails(monkey
     assert result.loc[0, "daily_source"] == "akshare"
     assert result.loc[0, "daily_quality_score"] == 88.0
     assert result.loc[0, "daily_quality_flags"] == "missing_volume"
+    assert result.attrs["daily_source_counts"] == {"akshare": 1}
+    assert result.attrs["daily_quality_flag_counts"] == {"missing_volume": 1}
+    assert result.attrs["daily_source_order_notes"] == ["daily source order adjusted by health: akshare"]
+    assert result.attrs["daily_source_health"] == {"akshare": {"successes": 1.0}}
     assert pd.isna(result.loc[1, "daily_data_points"])
 
 

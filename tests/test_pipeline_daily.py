@@ -56,6 +56,10 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
             enriched.at[idx, "daily_quality_score"] = 100 if is_target else 70
             enriched.at[idx, "daily_quality_flags"] = "" if is_target else "fallback_errors"
             enriched.at[idx, "daily_source"] = "tencent"
+        enriched.attrs["daily_success_count"] = len(enriched)
+        enriched.attrs["daily_source_counts"] = {"tencent": 2}
+        enriched.attrs["daily_quality_flag_counts"] = {"fallback_errors": 1}
+        enriched.attrs["daily_source_order_notes"] = ["daily source order adjusted by health: tencent,sina"]
         return enriched
 
     monkeypatch.setattr("alphasift.pipeline.fetch_snapshot_with_fallback", lambda sources, **kwargs: df)
@@ -83,6 +87,9 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
     assert result.picks[0].daily_quality_flags == ""
     assert result.picks[0].daily_source == "tencent"
     assert any("Daily K-line enrichment attempted 2 candidates" in item for item in result.degradation)
+    assert "Daily K-line sources: tencent=2" in result.degradation
+    assert "Daily K-line quality flags: fallback_errors=1" in result.degradation
+    assert "Daily K-line source ordering: daily source order adjusted by health: tencent,sina" in result.degradation
 
 
 def test_pipeline_preserves_degradation_when_hard_filter_empty(monkeypatch):

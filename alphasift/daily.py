@@ -74,6 +74,10 @@ def enrich_daily_features(
 
     result = df.copy()
     daily_errors: list[str] = []
+    daily_source_counts: dict[str, int] = {}
+    daily_quality_flag_counts: dict[str, int] = {}
+    daily_source_order_notes: list[str] = []
+    daily_source_health: dict[str, object] = {}
     success_count = 0
     selected_index = list(result.index[:max_rows])
     fetch_requests: list[tuple[object, str]] = []
@@ -84,7 +88,7 @@ def enrich_daily_features(
         code = raw_code.zfill(6) if raw_code.isdigit() else raw_code
         fetch_requests.append((idx, code))
 
-    def fetch_one(request: tuple[object, str]) -> tuple[object, dict[str, object], str | None]:
+    def fetch_one(request: tuple[object, str]) -> tuple[object, dict[str, object], str | None, dict[str, object]]:
         idx, code = request
         try:
             hist = fetch_daily_history(
@@ -97,9 +101,15 @@ def enrich_daily_features(
             )
             features = compute_daily_features(hist)
             features["daily_source"] = str(hist.attrs.get("daily_source", ""))
-            return idx, features, None
+            metadata = {
+                "daily_source": features["daily_source"],
+                "daily_quality_flags": features.get("daily_quality_flags", ""),
+                "daily_source_order_notes": list(hist.attrs.get("daily_source_order_notes", []) or []),
+                "daily_source_health": dict(hist.attrs.get("daily_source_health", {}) or {}),
+            }
+            return idx, features, None, metadata
         except Exception as exc:
-            return idx, dict(_DAILY_FEATURE_DEFAULTS), f"{code}: {exc}"
+            return idx, dict(_DAILY_FEATURE_DEFAULTS), f"{code}: {exc}", {}
 
     if len(fetch_requests) <= 1:
         fetched_rows = [fetch_one(request) for request in fetch_requests]
@@ -108,16 +118,35 @@ def enrich_daily_features(
         with ThreadPoolExecutor(max_workers=worker_limit) as executor:
             fetched_rows = list(executor.map(fetch_one, fetch_requests))
 
-    for idx, features, error in fetched_rows:
+    for idx, features, error, metadata in fetched_rows:
         if error:
             daily_errors.append(error)
         else:
             success_count += 1
+            source_name = str(metadata.get("daily_source") or "unknown")
+            daily_source_counts[source_name] = daily_source_counts.get(source_name, 0) + 1
+            for flag in str(metadata.get("daily_quality_flags") or "").split(";"):
+                if flag:
+                    daily_quality_flag_counts[flag] = daily_quality_flag_counts.get(flag, 0) + 1
+            order_notes = metadata.get("daily_source_order_notes", [])
+            if not isinstance(order_notes, list):
+                order_notes = []
+            for note in order_notes:
+                note_text = str(note)
+                if note_text and note_text not in daily_source_order_notes:
+                    daily_source_order_notes.append(note_text)
+            source_health = metadata.get("daily_source_health")
+            if isinstance(source_health, dict):
+                daily_source_health.update(source_health)
         for key, value in features.items():
             result.at[idx, key] = value
 
     result.attrs["daily_errors"] = daily_errors
     result.attrs["daily_success_count"] = success_count
+    result.attrs["daily_source_counts"] = daily_source_counts
+    result.attrs["daily_quality_flag_counts"] = daily_quality_flag_counts
+    result.attrs["daily_source_order_notes"] = daily_source_order_notes
+    result.attrs["daily_source_health"] = daily_source_health
     return result
 
 
